@@ -1,0 +1,3 @@
+logo: text_logo
+color_scheme: clean_blue
+fonts: default_sans_serif
