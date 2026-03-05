@@ -52,7 +52,7 @@ public:
     NRF24(uint8_t sck, uint8_t mosi, uint8_t miso, uint8_t ce, uint8_t csn) :
         pin_sck(sck), pin_mosi(mosi), pin_miso(miso), pin_ce(ce), pin_csn(csn) {}
 
-    void begin() {
+    void init() {
         pinMode(pin_sck, OUTPUT);
         pinMode(pin_mosi, OUTPUT);
         pinMode(pin_miso, INPUT);
@@ -64,7 +64,7 @@ public:
         digitalWrite(pin_csn, HIGH);
 
         delay(100);
-        writeRegister(0x00, 0x0E); // CONFIG: PWR_UP=1, PRIM_RX=0, EN_CRC=1, CRCO=1 (0x0E)
+        writeRegister(0x00, 0x0E); // CONFIG: PWR_UP=1, PRIM_RX=0, EN_CRC=1, CRCO=1 (2-byte CRC)
         writeRegister(0x01, 0x01); // EN_AA: Enable auto ack on pipe 0
         writeRegister(0x02, 0x01); // EN_RXADDR: Enable data pipe 0
         writeRegister(0x03, 0x03); // SETUP_AW: 5 bytes address
@@ -138,6 +138,7 @@ struct Packet {
     uint8_t crc;
 };
 
+// State Variables
 float currentTemp = 0.0;
 float targetTemp = 22.0;
 bool isBoilerOn = false;
@@ -146,6 +147,18 @@ String modeStr = "ROUTER";
 
 char opMode[2] = "1"; // "1"=Router, "2"=AP
 bool shouldSaveConfig = false;
+
+// Statistics & Logic
+uint32_t lastStateChangeTime = 0;
+uint32_t totalBoilerRunTime = 0; // ms
+uint32_t lastBoilerStartTime = 0;
+uint32_t boilerOnCount = 0;
+uint32_t lastPacketTime = 0;
+
+// History for chart (last 20 readings)
+#define HISTORY_LEN 20
+float tempHistory[HISTORY_LEN] = {0};
+uint8_t historyIdx = 0;
 
 void saveConfigCallback() {
     shouldSaveConfig = true;
@@ -190,7 +203,7 @@ void setupWiFi() {
     if (String(opMode) == "2") {
         modeStr = "AP MODE";
         WiFi.mode(WIFI_AP);
-        WiFi.softAP("Boiler-Setup"); // Works as standalone AP
+        WiFi.softAP("Boiler-Setup");
     } else {
         modeStr = "ROUTER";
         if (!wm.autoConnect("Boiler-Setup")) {
@@ -212,7 +225,7 @@ void drawSignalIcon(bool ok) {
     if (ok) {
         display.drawCircle(118, 12, 8, SSD1306_WHITE);
         display.drawCircle(118, 12, 5, SSD1306_WHITE);
-        display.fillRect(110, 12, 16, 10, SSD1306_BLACK); // clear bottom part
+        display.fillRect(110, 12, 16, 10, SSD1306_BLACK);
         display.drawLine(118, 12, 118, 20, SSD1306_WHITE);
         display.fillRect(117, 20, 3, 3, SSD1306_WHITE);
     } else {
@@ -240,7 +253,7 @@ void updateScreen() {
 
     // Center Row (Huge Text)
     display.setTextSize(3);
-    String tempStr = String(currentTemp, 1);
+    String tempStr = String(currentTemp, 1) + "C";
     display.getTextBounds(tempStr, 0, 0, &x1, &y1, &w, &h);
     display.setCursor((128 - w) / 2, 20);
     display.print(tempStr);
@@ -261,16 +274,73 @@ void updateScreen() {
 }
 
 void handleRoot() {
+    uint32_t uptime = millis() / 1000;
+    uint32_t h = uptime / 3600;
+    uint32_t m = (uptime % 3600) / 60;
+    uint32_t s = uptime % 60;
+
+    uint32_t runTimeSec = totalBoilerRunTime / 1000;
+    if (isBoilerOn) {
+        runTimeSec += (millis() - lastBoilerStartTime) / 1000;
+    }
+    uint32_t rth = runTimeSec / 3600;
+    uint32_t rtm = (runTimeSec % 3600) / 60;
+
+    String ipStr = WiFi.getMode() == WIFI_AP ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+    String stateStr = lastTxSuccess ? (isBoilerOn ? "<span style='color:orange;'>HEATING</span>" : "<span style='color:gray;'>IDLE</span>") : "<span style='color:red;'>NO SIGNAL</span>";
+    String signalStr = lastTxSuccess ? "<span style='color:green;'>Good</span>" : "<span style='color:red;'>Lost</span>";
+    uint32_t lastPktAgo = (millis() - lastPacketTime) / 1000;
+
     String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
-    html += "<style>body{background-color:#1a1a1a;color:white;font-family:sans-serif;text-align:center;padding:20px;}";
-    html += "input[type=range]{width:80%;} .status{font-size:24px;margin-top:20px;}</style></head><body>";
-    html += "<h2>Thermostat Control</h2>";
+    html += "<style>body{background-color:#1a1a1a;color:white;font-family:sans-serif;text-align:center;padding:10px;margin:0;}";
+    html += "input[type=range]{width:90%;height:30px;} .card{background:#2a2a2a;padding:15px;border-radius:10px;margin-bottom:15px;}";
+    html += "h1{margin:10px 0;font-size:48px;} .info{font-size:14px;color:#bbb;}</style></head><body>";
+
+    html += "<h2>Thermostat v5.1</h2>";
+
+    html += "<div class='card'>";
     html += "<h1>" + String(currentTemp, 1) + " &deg;C</h1>";
-    html += "<p>Target: <span id='tval'>" + String(targetTemp, 1) + "</span> &deg;C</p>";
-    html += "<input type='range' min='10' max='35' step='0.5' value='" + String(targetTemp, 1) + "' id='slider' oninput='document.getElementById(\"tval\").innerHTML=this.value' onchange='fetch(\"/set?t=\"+this.value)'>";
-    html += "<div class='status'>Boiler: ";
-    html += isBoilerOn ? "<span style='color:green;'>ON</span>" : "<span style='color:red;'>OFF</span>";
-    html += "</div></body></html>";
+    html += "<div style='font-size:24px;margin:10px 0;'>" + stateStr + "</div>";
+    html += "<p>Target: <span id='tval' style='font-size:20px;font-weight:bold;'>" + String(targetTemp, 1) + "</span> &deg;C</p>";
+    html += "<input type='range' min='10' max='30' step='0.5' value='" + String(targetTemp, 1) + "' id='slider' oninput='document.getElementById(\"tval\").innerHTML=this.value' onchange='fetch(\"/set?t=\"+this.value)'>";
+    html += "</div>";
+
+    html += "<div class='card' style='text-align:left;'>";
+    html += "<h3>Statistics</h3>";
+    html += "<div class='info'>";
+    html += "Uptime: " + String(h) + "h " + String(m) + "m " + String(s) + "s<br>";
+    html += "IP Address: " + ipStr + "<br>";
+    html += "Radio Link: " + signalStr + " (Last Pkt: " + String(lastPktAgo) + "s ago)<br>";
+    html += "Boiler Runs: " + String(boilerOnCount) + "<br>";
+    html += "Total Run Time: " + String(rth) + "h " + String(rtm) + "m<br>";
+    html += "</div></div>";
+
+    // Simple ASCII/SVG sparkline for temperature history
+    html += "<div class='card'><h3>Temp History (Last 20)</h3>";
+    html += "<svg width='100%' height='60' style='background:#111;border:1px solid #444;'>";
+    html += "<polyline fill='none' stroke='#00ff00' stroke-width='2' points='";
+
+    float minT = 100.0, maxT = -100.0;
+    for(int i=0; i<HISTORY_LEN; i++) {
+        if(tempHistory[i] != 0) {
+            if(tempHistory[i] < minT) minT = tempHistory[i];
+            if(tempHistory[i] > maxT) maxT = tempHistory[i];
+        }
+    }
+    if (maxT == minT) { maxT += 1; minT -= 1; }
+
+    for(int i=0; i<HISTORY_LEN; i++) {
+        int realIdx = (historyIdx + i) % HISTORY_LEN;
+        if(tempHistory[realIdx] != 0) {
+            int x = (i * 100) / (HISTORY_LEN-1);
+            int y = 60 - ((tempHistory[realIdx] - minT) * 60 / (maxT - minT));
+            html += String(x) + "%," + String(y) + " ";
+        }
+    }
+    html += "'/></svg></div>";
+
+    html += "<script>setInterval(()=>location.reload(), 10000);</script>";
+    html += "</body></html>";
     server.send(200, "text/html", html);
 }
 
@@ -293,11 +363,11 @@ void setup() {
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(1);
     display.setCursor(0, 0);
-    display.print("Booting...");
+    display.print("Booting v5.1...");
     display.display();
 
     sensors.begin();
-    radio.begin();
+    radio.init();
 
     loadConfig();
     setupWiFi();
@@ -305,10 +375,13 @@ void setup() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/set", HTTP_GET, handleSetTemp);
     server.begin();
+
+    lastStateChangeTime = millis() - 180000; // Allow immediate first turn on/off
 }
 
 void loop() {
     static uint32_t lastRead = 0;
+    static uint32_t lastHist = 0;
     static uint32_t btnPressTime = 0;
     static bool btnPressed = false;
 
@@ -340,19 +413,45 @@ void loop() {
         sensors.requestTemperatures();
         currentTemp = sensors.getTempCByIndex(0);
 
-        if (currentTemp < targetTemp - 0.5) {
-            isBoilerOn = true;
-        } else if (currentTemp >= targetTemp) {
-            isBoilerOn = false;
+        // Save to history every 30s
+        if (millis() - lastHist >= 30000) {
+            lastHist = millis();
+            tempHistory[historyIdx] = currentTemp;
+            historyIdx = (historyIdx + 1) % HISTORY_LEN;
+        }
+
+        // Hysteresis & Minimum Run/Pause Time Logic (3 mins = 180000 ms)
+        uint32_t timeSinceLastChange = millis() - lastStateChangeTime;
+        bool wantBoilerOn = isBoilerOn;
+
+        if (currentTemp <= targetTemp - 0.5) {
+            wantBoilerOn = true;
+        } else if (currentTemp >= targetTemp + 0.5) {
+            wantBoilerOn = false;
+        }
+
+        if (wantBoilerOn != isBoilerOn && timeSinceLastChange >= 180000) {
+            isBoilerOn = wantBoilerOn;
+            lastStateChangeTime = millis();
+
+            if (isBoilerOn) {
+                boilerOnCount++;
+                lastBoilerStartTime = millis();
+            } else {
+                totalBoilerRunTime += (millis() - lastBoilerStartTime);
+            }
         }
 
         Packet pkt;
         pkt.cmd = isBoilerOn ? 1 : 0;
-        pkt.temp = (int16_t)(currentTemp * 100);
-        pkt.target = (int16_t)(targetTemp * 100);
+        pkt.temp = (int16_t)(currentTemp * 10);
+        pkt.target = (int16_t)(targetTemp * 10);
         pkt.crc = pkt.cmd ^ (pkt.temp & 0xFF) ^ (pkt.target & 0xFF);
 
         lastTxSuccess = radio.send(&pkt, sizeof(pkt));
+        if (lastTxSuccess) {
+            lastPacketTime = millis();
+        }
 
         updateScreen();
     }

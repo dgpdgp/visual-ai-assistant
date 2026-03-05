@@ -89,9 +89,9 @@ void loop() {
             }
 
             Serial.print("Received - Temp: ");
-            Serial.print(pkt.temp / 100.0);
+            Serial.print(pkt.temp / 10.0);
             Serial.print(" Target: ");
-            Serial.print(pkt.target / 100.0);
+            Serial.print(pkt.target / 10.0);
             Serial.print(" Cmd: ");
             Serial.println(pkt.cmd);
         }
